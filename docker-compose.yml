@@ -1,0 +1,118 @@
+# Описуємо всі сервіси (контейнери), які потрібно запустити
+# =============================================
+# Docker Compose
+#
+# build      -> збирає Docker Image
+# image      -> використовує готовий Docker Image
+#
+# ports      -> ПК:Контейнер
+#
+# volumes    -> синхронізація файлів або постійне сховище
+#
+# depends_on -> порядок запуску контейнерів
+#
+# environment -> змінні середовища
+#
+# command    -> команда, яка запускається всередині контейнера
+# =============================================
+
+services:
+
+  # React/Vite Frontend
+  frontend:
+    build: ./frontend
+    command: npm run dev -- --host
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"     
+
+  # Node.js Backend
+  backend:
+    build: ./backend           # Збираємо Docker-образ з папки backend
+
+    # Запускаємо режим розробки
+    # node --watch автоматично перезапускає сервер після зміни файлів
+    command: npm run dev
+
+    # Монтуємо локальну папку backend в /app контейнера.
+    # Завдяки цьому всі зміни у VS Code одразу видно всередині Docker.
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+    ports:
+      - "3000:3000"
+
+    # Backend запускається після MySQL
+    depends_on:
+      - mysql
+
+  # Сервер бази даних
+  mysql:
+    image: mysql:8.4
+
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: dzhmil_system_db
+
+    # Постійне сховище бази даних.
+    # Навіть якщо контейнер видалити,
+    # дані залишаться в Docker Volume.
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  # Веб-інтерфейс для MySQL
+  phpmyadmin:
+    image: phpmyadmin
+
+    ports:
+      - "8080:80"
+
+    environment:
+      # До якого MySQL підключатися
+      PMA_HOST: mysql
+
+    depends_on:
+      - mysql
+
+# Docker Volume.
+# Тут фізично зберігаються файли MySQL.
+volumes:
+  mysql_data:
+
+
+  # ./backend:/app
+#
+# ЛІВА ЧАСТИНА  -> твій комп'ютер
+# ПРАВА ЧАСТИНА -> контейнер Docker
+#
+# Windows
+# C:\Users\User\Desktop\service\container-bee\backend
+#
+# Linux (Docker)
+# /app
+#
+# VS Code ---> Docker ---> Node.js
+
+# --------------------------------------------
+# Коли використовувати Docker
+#
+# Змінив server.js
+# -> Нічого (node --watch)
+#
+# Змінив docker-compose.yml
+# -> docker compose down
+# -> docker compose up
+#
+# Змінив Dockerfile
+# -> docker compose up --build
+#
+# Додав npm package
+# -> docker compose up --build
+#
+# НЕ використовувати:
+# docker compose down -v
+# якщо не хочеш втратити базу даних.
+# --------------------------------------------
