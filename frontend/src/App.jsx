@@ -2354,6 +2354,316 @@ function TechWorkPanel({ rows, onLoad, onClear }) {
   );
 }
 
+/* =========================================================
+   Matomo — журнал відвідувань (люди / Googlebot / Bingbot / AI-боти)
+========================================================= */
+
+const MATOMO_API_BASE = (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_BASE) || "http://localhost:3000";
+
+const MATOMO_CATEGORY_META = {
+  human:       { label: "Люди",         color: "#0EA5E9", icon: "👤" },
+  ai_referral: { label: "AI-реферали",  color: "#EC4899", icon: "🧠" },
+  google:      { label: "Googlebot",    color: "#22C55E", icon: "🟢" },
+  bing:        { label: "Bingbot",      color: "#3B82F6", icon: "🔷" },
+  ai:          { label: "AI-боти",      color: "#A855F7", icon: "🤖" },
+  other_bot:   { label: "Інші боти",    color: "#F59E0B", icon: "🕷️" },
+};
+
+// Filter chips shown above the visits table. Most map straight to a backend
+// "category"; the two Google/Bing-human ones add a "source" refinement on top
+// of category=human (people who searched vs. the crawler bots of the same name).
+const MATOMO_FILTER_CHIPS = [
+  { key: "all",          label: "Усі",            icon: null, color: null,      category: null,        source: null },
+  { key: "human",        label: "Люди",           icon: "👤", color: "#0EA5E9", category: "human",     source: null },
+  { key: "human_google", label: "Люди з Google",  icon: "🔎", color: "#6366F1", category: "human",     source: "Google" },
+  { key: "human_bing",   label: "Люди з Bing",    icon: "🔎", color: "#0891B2", category: "human",     source: "Bing" },
+  { key: "ai_referral",  label: "AI-реферали",    icon: "🧠", color: "#EC4899", category: "ai_referral", source: null },
+  { key: "google",       label: "Googlebot",      icon: "🟢", color: "#22C55E", category: "google",    source: null },
+  { key: "bing",         label: "Bingbot",        icon: "🔷", color: "#3B82F6", category: "bing",      source: null },
+  { key: "ai",           label: "AI-боти",        icon: "🤖", color: "#A855F7", category: "ai",        source: null },
+  { key: "other_bot",    label: "Інші боти",      icon: "🕷️", color: "#F59E0B", category: "other_bot", source: null },
+];
+
+const MATOMO_DEVICE_LABELS = {
+  0: "Десктоп", 1: "Смартфон", 2: "Планшет", 3: "Кнопковий телефон",
+  4: "Консоль", 5: "TV", 6: "Авто", 7: "Дисплей", 8: "Камера",
+  9: "Медіаплеєр", 10: "Фаблет", 11: "Розумна колонка", 12: "Гаджет", 13: "Периферія",
+};
+
+function matomoDaysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toISOString().slice(0, 10);
+}
+
+function MatomoSortTh({ column, label, align = "left", sortBy, sortDir, onSort }) {
+  const active = sortBy === column;
+  return (
+    <th
+      onClick={() => onSort(column)}
+      className={`cursor-pointer select-none px-2 py-1.5 whitespace-nowrap hover:text-slate-700 ${align === "right" ? "text-right" : "text-left"} ${active ? "text-slate-800" : ""}`}
+      title="Сортувати"
+    >
+      {label}
+      <span className={`ml-1 inline-block w-2.5 text-[9px] ${active ? "text-slate-700" : "text-slate-300"}`}>
+        {active ? (sortDir === "asc" ? "▲" : "▼") : "▲"}
+      </span>
+    </th>
+  );
+}
+
+function MatomoLogPanel() {
+  const [open, setOpen] = useState(false);
+  const [sites, setSites] = useState([]);
+  const [siteId, setSiteId] = useState("all");
+  const [from, setFrom] = useState(matomoDaysAgo(29));
+  const [to, setTo] = useState(matomoDaysAgo(0));
+
+  const [summary, setSummary] = useState(null);
+  const [loadingSummary, setLoadingSummary] = useState(false);
+  const [summaryError, setSummaryError] = useState(null);
+
+  const [filterKey, setFilterKey] = useState("all");
+  const activeChip = MATOMO_FILTER_CHIPS.find((c) => c.key === filterKey) || MATOMO_FILTER_CHIPS[0];
+  const [page, setPage] = useState(1);
+  const pageSize = 25;
+  const [visits, setVisits] = useState(null);
+  const [loadingVisits, setLoadingVisits] = useState(false);
+  const [visitsError, setVisitsError] = useState(null);
+  const [sortBy, setSortBy] = useState("time");
+  const [sortDir, setSortDir] = useState("desc");
+
+  function toggleSort(column) {
+    if (sortBy === column) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortBy(column);
+      setSortDir(column === "time" ? "desc" : "asc");
+    }
+  }
+
+  useEffect(() => {
+    if (!open || sites.length) return;
+    fetch(`${MATOMO_API_BASE}/api/matomo/sites`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Не вдалося завантажити список сайтів"))))
+      .then(setSites)
+      .catch(() => {});
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoadingSummary(true); setSummaryError(null);
+    const params = new URLSearchParams({ from, to, siteId });
+    fetch(`${MATOMO_API_BASE}/api/matomo/summary?${params}`)
+      .then(async (r) => { const d = await r.json(); if (!r.ok) throw new Error(d.error || "Помилка запиту"); return d; })
+      .then(setSummary)
+      .catch((err) => setSummaryError(err.message))
+      .finally(() => setLoadingSummary(false));
+  }, [open, from, to, siteId]);
+
+  useEffect(() => { setPage(1); }, [from, to, siteId, filterKey, sortBy, sortDir]);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoadingVisits(true); setVisitsError(null);
+    const params = new URLSearchParams({ from, to, siteId, page: String(page), pageSize: String(pageSize), sortBy, sortDir });
+    if (activeChip.category) params.set("category", activeChip.category);
+    if (activeChip.source) params.set("source", activeChip.source);
+    fetch(`${MATOMO_API_BASE}/api/matomo/visits?${params}`)
+      .then(async (r) => { const d = await r.json(); if (!r.ok) throw new Error(d.error || "Помилка запиту"); return d; })
+      .then(setVisits)
+      .catch((err) => setVisitsError(err.message))
+      .finally(() => setLoadingVisits(false));
+  }, [open, from, to, siteId, filterKey, page, sortBy, sortDir]);
+
+  const totals = summary?.totals;
+  const total = summary?.total || 0;
+  const totalPages = visits ? Math.max(1, Math.ceil(visits.total / pageSize)) : 1;
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-5 md:col-span-2">
+      <button type="button" className="flex w-full items-center justify-between text-left" onClick={() => setOpen((o) => !o)}>
+        <div className="flex items-center gap-2">
+          <Globe className="h-4 w-4 text-sky-600" />
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Відвідування сайту (Matomo)</h3>
+        </div>
+        <span className="text-xs text-slate-400">{open ? "Згорнути ▲" : "Показати ▼"}</span>
+      </button>
+      <p className="mt-1 text-xs text-slate-300 leading-relaxed">
+        💡 Хто заходить на сайт: реальні люди, живі відвідувачі з ChatGPT/Gemini/Claude/Perplexity (AI-реферали), Googlebot, Bingbot, AI-краулери (GPTBot, ClaudeBot тощо) та інші боти. Клікніть, щоб розгорнути й обрати сайт та період.
+      </p>
+
+      {open && (
+        <div className="mt-4 space-y-4">
+          <div className="flex flex-wrap items-end gap-3">
+            <div>
+              <label className="block text-[11px] text-slate-400">Сайт</label>
+              <select value={siteId} onChange={(e) => setSiteId(e.target.value)} className="mt-0.5 rounded-md border border-slate-300 px-2 py-1 text-sm">
+                <option value="all">Усі сайти</option>
+                {sites.map((s) => <option key={s.idsite} value={s.idsite}>{s.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-[11px] text-slate-400">Від</label>
+              <input type="date" value={from} max={to} onChange={(e) => setFrom(e.target.value)} className="mt-0.5 rounded-md border border-slate-300 px-2 py-1 text-sm" />
+            </div>
+            <div>
+              <label className="block text-[11px] text-slate-400">До</label>
+              <input type="date" value={to} min={from} max={matomoDaysAgo(0)} onChange={(e) => setTo(e.target.value)} className="mt-0.5 rounded-md border border-slate-300 px-2 py-1 text-sm" />
+            </div>
+            <div className="flex gap-1">
+              {[7, 30, 90].map((n) => (
+                <button key={n} type="button"
+                  onClick={() => { setFrom(matomoDaysAgo(n - 1)); setTo(matomoDaysAgo(0)); }}
+                  className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50">
+                  {n} дн.
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {summaryError && <p className="text-xs text-red-600">⚠️ {summaryError}</p>}
+          <p className="text-[11px] text-slate-300">💡 «Люди» та «AI-реферали» — це візити (сесії): другі — живі люди, яких на сайт привела відповідь ChatGPT/Gemini/Claude/Perplexity тощо. «Боти» — окремі запити до сторінок (один краулер може зробити багато запитів за один захід), тому шкали не завжди напряму порівнювані.</p>
+
+          <div className="grid grid-cols-2 items-start gap-2 sm:grid-cols-4 lg:grid-cols-9">
+            <div className="rounded-md bg-slate-50 p-3">
+              <div className="text-[11px] text-slate-400">Всього візитів</div>
+              <div className="font-mono text-lg font-semibold text-slate-800">{loadingSummary ? "…" : total.toLocaleString("uk-UA")}</div>
+            </div>
+            {Object.entries(MATOMO_CATEGORY_META).map(([key, meta]) => {
+              const val = totals?.[key] || 0;
+              const pct = total ? Math.round((val / total) * 100) : 0;
+              const sources = key === "ai_referral" ? summary?.aiReferralSources
+                : key === "human" ? summary?.humanSources
+                : null;
+              return (
+                <div key={key} className="rounded-md bg-slate-50 p-3">
+                  <div className="text-[11px] text-slate-400">{meta.icon} {meta.label}</div>
+                  <div className="font-mono text-lg font-semibold" style={{ color: meta.color }}>
+                    {loadingSummary ? "…" : val.toLocaleString("uk-UA")}
+                  </div>
+                  <div className="text-[10px] text-slate-400">{total ? `${pct}%` : ""}</div>
+                  {sources?.length > 0 && (
+                    <div className="mt-1.5 space-y-0.5 border-t border-slate-200 pt-1.5">
+                      {sources.map((s) => (
+                        <div key={s.name} className="flex items-center justify-between gap-2 text-[10px] text-slate-500">
+                          <span className="truncate">{s.name}</span>
+                          <span className="font-mono text-slate-600">{s.count.toLocaleString("uk-UA")}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {[
+              { name: "Google", label: "Люди з Google", icon: "🔎", color: "#6366F1" },
+              { name: "Bing", label: "Люди з Bing", icon: "🔎", color: "#0891B2" },
+            ].map(({ name, label, icon, color }) => {
+              const val = summary?.humanSources?.find((s) => s.name === name)?.count || 0;
+              const pct = total ? Math.round((val / total) * 100) : 0;
+              return (
+                <div key={name} className="rounded-md bg-slate-50 p-3">
+                  <div className="text-[11px] text-slate-400">{icon} {label}</div>
+                  <div className="font-mono text-lg font-semibold" style={{ color }}>
+                    {loadingSummary ? "…" : val.toLocaleString("uk-UA")}
+                  </div>
+                  <div className="text-[10px] text-slate-400">{total ? `${pct}%` : ""}</div>
+                </div>
+              );
+            })}
+          </div>
+
+          {summary?.days?.length > 0 && (
+            <div className="h-56 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={summary.days}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="day" tick={{ fontSize: 10 }} />
+                  <YAxis tick={{ fontSize: 10 }} allowDecimals={false} />
+                  <Tooltip />
+                  {Object.entries(MATOMO_CATEGORY_META).map(([key, meta]) => (
+                    <Bar key={key} dataKey={key} stackId="v" name={meta.label} fill={meta.color} />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-1.5">
+            {MATOMO_FILTER_CHIPS.map((chip) => (
+              <button
+                key={chip.key}
+                type="button"
+                onClick={() => setFilterKey(chip.key)}
+                className={`rounded-full px-2.5 py-1 text-xs ${filterKey === chip.key ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
+              >
+                {chip.icon ? `${chip.icon} ${chip.label}` : chip.label}
+              </button>
+            ))}
+          </div>
+
+          {visitsError && <p className="text-xs text-red-600">⚠️ {visitsError}</p>}
+
+          <div className="overflow-x-auto rounded-md border border-slate-200">
+            <table className="min-w-full text-xs">
+              <thead className="bg-slate-50 text-slate-500">
+                <tr>
+                  <MatomoSortTh column="time" label="Час" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                  <MatomoSortTh column="category" label="Тип" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                  <MatomoSortTh column="detail" label="Браузер / бот" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                  <MatomoSortTh column="extra" label="ОС / тип бота" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                  <MatomoSortTh column="deviceType" label="Пристрій" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                  <MatomoSortTh column="country" label="Країна" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                  <MatomoSortTh column="sourceOrUrl" label="Джерело / URL" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                  <MatomoSortTh column="httpStatus" label="HTTP" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                  <MatomoSortTh column="ip" label="IP" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                  <MatomoSortTh column="actions" label="Дій" align="right" sortBy={sortBy} sortDir={sortDir} onSort={toggleSort} />
+                </tr>
+              </thead>
+              <tbody>
+                {(visits?.rows || []).map((v) => {
+                  const meta = MATOMO_CATEGORY_META[v.category] || MATOMO_CATEGORY_META.human;
+                  return (
+                    <tr key={`${v.category}-${v.id}`} className="border-t border-slate-100">
+                      <td className="px-2 py-1.5 font-mono text-slate-500">{String(v.time).replace("T", " ").slice(0, 19)}</td>
+                      <td className="px-2 py-1.5" style={{ color: meta.color }}>{meta.icon} {meta.label}</td>
+                      <td className="px-2 py-1.5 text-slate-600">{v.detail || "—"}</td>
+                      <td className="px-2 py-1.5 text-slate-500">{v.extra || "—"}</td>
+                      <td className="px-2 py-1.5 text-slate-500">{MATOMO_DEVICE_LABELS[v.deviceType] ?? "—"}</td>
+                      <td className="px-2 py-1.5 text-slate-500">{v.country ? String(v.country).toUpperCase() : "—"}</td>
+                      <td className="px-2 py-1.5 max-w-[240px] truncate text-slate-500" title={v.sourceOrUrl || ""}>{v.sourceOrUrl || "—"}</td>
+                      <td className="px-2 py-1.5 text-slate-500">{v.httpStatus ?? "—"}</td>
+                      <td className="px-2 py-1.5 font-mono text-slate-400">{v.ip || "—"}</td>
+                      <td className="px-2 py-1.5 text-right text-slate-500">{v.actions ?? "—"}</td>
+                    </tr>
+                  );
+                })}
+                {!loadingVisits && visits && visits.rows.length === 0 && (
+                  <tr><td colSpan={10} className="px-2 py-6 text-center text-slate-400">Немає візитів за обраний період.</td></tr>
+                )}
+                {loadingVisits && (
+                  <tr><td colSpan={10} className="px-2 py-6 text-center text-slate-400">Завантаження…</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {visits && visits.total > 0 && (
+            <div className="flex items-center justify-between text-xs text-slate-500">
+              <span>Знайдено {visits.total.toLocaleString("uk-UA")} візитів · сторінка {page} з {totalPages}</span>
+              <div className="flex gap-1">
+                <button type="button" disabled={page <= 1} onClick={() => setPage((p) => p - 1)} className="rounded-md border border-slate-200 px-2 py-1 disabled:opacity-40">← Назад</button>
+                <button type="button" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)} className="rounded-md border border-slate-200 px-2 py-1 disabled:opacity-40">Далі →</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OurDomainsPanel({ rows, onLoad, onClear }) {
   const inputRef = React.useRef(null);
   const [loading, setLoading] = useState(false);
@@ -13702,6 +14012,7 @@ ${JSON.stringify(summary)}`;
     return (
       <div>
         <TabTOC key="data" sections={[
+          { id: "toc-dt-matomo", label: "Відвідування (Matomo)" },
           { id: "toc-dt-plan",   label: "Контент і лінки" },
           { id: "toc-dt-seo",    label: "SEO-аналітика" },
           { id: "toc-dt-ref",    label: "Довідники" },
@@ -13714,6 +14025,11 @@ ${JSON.stringify(summary)}`;
           </div>
         )}
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+
+          {/* ── Відвідування (Matomo) ───────────────────── */}
+          <div id="toc-dt-matomo" className="contents">
+          <MatomoLogPanel />
+          </div>
 
           {/* ── Контент і лінки ──────────────────────────── */}
           <div id="toc-dt-plan" className="contents">

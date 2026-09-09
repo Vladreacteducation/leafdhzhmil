@@ -22,11 +22,15 @@ services:
   frontend:
     build: ./frontend
     command: npm run dev -- --host
+    environment:
+      # Порт 3000 на цій машині вже зайнятий іншим (не пов'язаним) проєктом,
+      # тому бекенд цього проєкту прокинутий на хостовий порт 3010 (див. нижче).
+      - VITE_API_BASE=http://localhost:3010
     volumes:
       - ./frontend:/app
       - /app/node_modules
     ports:
-      - "5173:5173"     
+      - "5173:5173"
 
   # Node.js Backend
   backend:
@@ -43,7 +47,9 @@ services:
       - /app/node_modules
 
     ports:
-      - "3000:3000"
+      # Хост:Контейнер — хостовий 3000 тут зайнятий іншим проєктом (wpguard),
+      # тож бекенд назовні дивиться портом 3010, всередині контейнера все ще 3000.
+      - "3010:3000"
 
     # Backend запускається після MySQL
     depends_on:
