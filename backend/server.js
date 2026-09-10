@@ -30,20 +30,48 @@ app.get('/api', (req, res) => {
    Matomo (external, read-only analytics DB)
 ========================================================= */
 
-let matomoPool = null;
+// Multiple, independent Matomo installations (different servers, different DBs)
+// can be configured: unsuffixed MATOMO_DB_* for the first, MATOMO2_DB_* for the
+// second, and so on. Their idsite values can collide (each installation numbers
+// its own sites from 1), so every site is addressed everywhere in this API as a
+// composite "<instanceId>:<idsite>" string, never a bare idsite.
+function buildMatomoInstances() {
+  const instances = [];
+  for (const { suffix, id } of [{ suffix: '', id: '1' }, { suffix: '2', id: '2' }]) {
+    const host = process.env[`MATOMO${suffix}_DB_HOST`];
+    if (!host) continue;
+    instances.push({
+      id,
+      label: process.env[`MATOMO${suffix}_LABEL`] || `Matomo ${id}`,
+      host,
+      port: process.env[`MATOMO${suffix}_DB_PORT`] ? parseInt(process.env[`MATOMO${suffix}_DB_PORT`], 10) : 3306,
+      user: process.env[`MATOMO${suffix}_DB_USER`],
+      password: process.env[`MATOMO${suffix}_DB_PASSWORD`],
+      database: process.env[`MATOMO${suffix}_DB_NAME`],
+      tablePrefix: process.env[`MATOMO${suffix}_TABLE_PREFIX`] || 'matomo_',
+      pool: null,
+    });
+  }
+  return instances;
+}
 
-function getMatomoPool() {
-  if (matomoPool) return matomoPool;
-  const { MATOMO_DB_HOST, MATOMO_DB_PORT, MATOMO_DB_USER, MATOMO_DB_PASSWORD, MATOMO_DB_NAME } = process.env;
-  if (!MATOMO_DB_HOST || !MATOMO_DB_USER || !MATOMO_DB_NAME) {
+let matomoInstances = null;
+function getMatomoInstances() {
+  if (!matomoInstances) matomoInstances = buildMatomoInstances();
+  if (!matomoInstances.length) {
     throw new Error('Matomo DB не налаштовано (заповніть MATOMO_DB_HOST / MATOMO_DB_USER / MATOMO_DB_PASSWORD / MATOMO_DB_NAME у backend/.env)');
   }
-  matomoPool = mysql.createPool({
-    host: MATOMO_DB_HOST,
-    port: MATOMO_DB_PORT ? parseInt(MATOMO_DB_PORT, 10) : 3306,
-    user: MATOMO_DB_USER,
-    password: MATOMO_DB_PASSWORD,
-    database: MATOMO_DB_NAME,
+  return matomoInstances;
+}
+
+function getPool(instance) {
+  if (instance.pool) return instance.pool;
+  instance.pool = mysql.createPool({
+    host: instance.host,
+    port: instance.port,
+    user: instance.user,
+    password: instance.password,
+    database: instance.database,
     waitForConnections: true,
     connectionLimit: 5,
     connectTimeout: 10000,
@@ -52,12 +80,46 @@ function getMatomoPool() {
     // .toISOString() shifts the day by the server's local UTC offset.
     dateStrings: ['DATE'],
   });
-  return matomoPool;
+  return instance.pool;
 }
 
-function matomoTable(name) {
-  const prefix = process.env.MATOMO_TABLE_PREFIX || 'matomo_';
-  return `${prefix}${name}`;
+function matomoTable(instance, name) {
+  return `${instance.tablePrefix}${name}`;
+}
+
+function compositeSiteId(instance, idsite) {
+  return `${instance.id}:${idsite}`;
+}
+
+// Resolves the "siteId" query param into concrete (instance, idsite) targets to
+// query: a specific site -> exactly one target; "all"/missing -> every configured
+// instance with no idsite filter (i.e. every site in each).
+function resolveInstanceTargets(rawSiteId, instances) {
+  if (rawSiteId && rawSiteId !== 'all') {
+    const [instId, idsiteStr] = String(rawSiteId).split(':');
+    const idsite = parseInt(idsiteStr, 10);
+    const instance = instances.find((i) => i.id === instId);
+    if (instance && Number.isFinite(idsite)) return [{ instance, idsite }];
+    // Legacy fallback: a bare integer (from before multi-instance support)
+    // is treated as an idsite on the first configured instance.
+    const legacyIdsite = parseInt(rawSiteId, 10);
+    if (Number.isFinite(legacyIdsite)) return [{ instance: instances[0], idsite: legacyIdsite }];
+  }
+  return instances.map((instance) => ({ instance, idsite: null }));
+}
+
+// NULL sorts as the smallest value (first in ASC, last in DESC) — matches MySQL's
+// default so results look the same whether one instance answered or several got merged.
+function compareRawRows(a, b, column, dirAsc) {
+  const av = a[column], bv = b[column];
+  if (av == null && bv == null) return 0;
+  if (av == null) return dirAsc ? -1 : 1;
+  if (bv == null) return dirAsc ? 1 : -1;
+  let cmp;
+  if (av instanceof Date || bv instanceof Date) cmp = new Date(av) - new Date(bv);
+  else if (typeof av === 'number' && typeof bv === 'number') cmp = av - bv;
+  else cmp = String(av).localeCompare(String(bv));
+  return dirAsc ? cmp : -cmp;
 }
 
 // matomo_log_visit holds only real (JS-tracked) browser visits — always "human".
@@ -104,11 +166,27 @@ function clampInt(value, def, min, max) {
 
 app.get('/api/matomo/sites', async (req, res) => {
   try {
-    const pool = getMatomoPool();
-    const [rows] = await pool.query(
-      `SELECT idsite, name, main_url FROM ${matomoTable('site')} ORDER BY idsite`
-    );
-    res.json(rows);
+    const instances = getMatomoInstances();
+    const settled = await Promise.allSettled(instances.map(async (instance) => {
+      const pool = getPool(instance);
+      const [rows] = await pool.query(
+        `SELECT idsite, name, main_url FROM ${matomoTable(instance, 'site')} ORDER BY idsite`
+      );
+      return rows.map((r) => ({
+        siteId: compositeSiteId(instance, r.idsite),
+        name: r.name,
+        main_url: r.main_url,
+        instance: instance.id,
+        instanceLabel: instance.label,
+      }));
+    }));
+
+    const sites = [];
+    for (const s of settled) {
+      if (s.status === 'fulfilled') sites.push(...s.value);
+      else console.error('Matomo /sites instance error:', s.reason?.message);
+    }
+    res.json(sites);
   } catch (err) {
     console.error('Matomo /sites error:', err.message);
     res.status(500).json({ error: err.message });
@@ -117,63 +195,78 @@ app.get('/api/matomo/sites', async (req, res) => {
 
 app.get('/api/matomo/summary', async (req, res) => {
   try {
-    const pool = getMatomoPool();
+    const instances = getMatomoInstances();
     const from = parseDateParam(req.query.from, daysAgo(29));
     const to = parseDateParam(req.query.to, isoDate(new Date()));
     const rawSiteId = req.query.siteId;
-    const siteId = rawSiteId && rawSiteId !== 'all' ? clampInt(rawSiteId, null, 1, 2 ** 31 - 1) : null;
+    const targets = resolveInstanceTargets(rawSiteId, instances);
 
-    const humanParams = [from, to];
-    let humanSiteFilter = '';
-    if (siteId) { humanSiteFilter = 'AND idsite = ?'; humanParams.push(siteId); }
+    const perTarget = await Promise.all(targets.map(async ({ instance, idsite }) => {
+      const pool = getPool(instance);
+      const humanSiteFilter = idsite ? 'AND idsite = ?' : '';
+      const humanParams = [from, to, ...(idsite ? [idsite] : [])];
+      const botSiteFilter = idsite ? 'AND idsite = ?' : '';
+      const botParams = [from, to, ...(idsite ? [idsite] : [])];
 
-    const botParams = [from, to];
-    let botSiteFilter = '';
-    if (siteId) { botSiteFilter = 'AND idsite = ?'; botParams.push(siteId); }
+      const [humanRows] = await pool.query(
+        `SELECT DATE(visit_last_action_time) AS day, ${HUMAN_CATEGORY_CASE_SQL} AS category, COUNT(*) AS n
+         FROM ${matomoTable(instance, 'log_visit')}
+         WHERE visit_last_action_time >= ? AND visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
+         ${humanSiteFilter}
+         GROUP BY day, category`,
+        humanParams
+      );
 
-    const [humanRows] = await pool.query(
-      `SELECT DATE(visit_last_action_time) AS day, ${HUMAN_CATEGORY_CASE_SQL} AS category, COUNT(*) AS n
-       FROM ${matomoTable('log_visit')}
-       WHERE visit_last_action_time >= ? AND visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
-       ${humanSiteFilter}
-       GROUP BY day, category`,
-      humanParams
-    );
+      const [botRows] = await pool.query(
+        `SELECT DATE(server_time) AS day, ${botCategoryCaseSql('bot_name')} AS category, COUNT(*) AS n
+         FROM ${matomoTable(instance, 'log_bot_request')}
+         WHERE server_time >= ? AND server_time < DATE_ADD(?, INTERVAL 1 DAY)
+         ${botSiteFilter}
+         GROUP BY day, category`,
+        botParams
+      );
 
-    const [botRows] = await pool.query(
-      `SELECT DATE(server_time) AS day, ${botCategoryCaseSql('bot_name')} AS category, COUNT(*) AS n
-       FROM ${matomoTable('log_bot_request')}
-       WHERE server_time >= ? AND server_time < DATE_ADD(?, INTERVAL 1 DAY)
-       ${botSiteFilter}
-       GROUP BY day, category`,
-      botParams
-    );
+      // Which specific AI platform (ChatGPT / Gemini / Claude / Perplexity / ...)
+      // sent each referred visit — the ai_referral bucket alone doesn't say that.
+      const [aiReferralSourceRows] = await pool.query(
+        `SELECT referer_name AS name, COUNT(*) AS n
+         FROM ${matomoTable(instance, 'log_visit')}
+         WHERE visit_last_action_time >= ? AND visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
+         AND referer_type = 8
+         ${humanSiteFilter}
+         GROUP BY referer_name`,
+        humanParams
+      );
 
-    // Which specific AI platform (ChatGPT / Gemini / Claude / Perplexity / ...)
-    // sent each referred visit — the ai_referral bucket alone doesn't say that.
-    const [aiReferralSourceRows] = await pool.query(
-      `SELECT referer_name AS name, COUNT(*) AS n
-       FROM ${matomoTable('log_visit')}
-       WHERE visit_last_action_time >= ? AND visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
-       AND referer_type = 8
-       ${humanSiteFilter}
-       GROUP BY referer_name
-       ORDER BY n DESC`,
-      humanParams
-    );
+      // Same idea for regular human visits: which search engine / site / direct
+      // entry actually brought them (Google vs Bing vs direct vs ...).
+      const [humanSourceRows] = await pool.query(
+        `SELECT COALESCE(NULLIF(referer_name,''), 'Прямий вхід') AS name, COUNT(*) AS n
+         FROM ${matomoTable(instance, 'log_visit')}
+         WHERE visit_last_action_time >= ? AND visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
+         AND referer_type != 8
+         ${humanSiteFilter}
+         GROUP BY name`,
+        humanParams
+      );
 
-    // Same idea for regular human visits: which search engine / site / direct
-    // entry actually brought them (Google vs Bing vs direct vs ...).
-    const [humanSourceRows] = await pool.query(
-      `SELECT COALESCE(NULLIF(referer_name,''), 'Прямий вхід') AS name, COUNT(*) AS n
-       FROM ${matomoTable('log_visit')}
-       WHERE visit_last_action_time >= ? AND visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
-       AND referer_type != 8
-       ${humanSiteFilter}
-       GROUP BY name
-       ORDER BY n DESC`,
-      humanParams
-    );
+      return { humanRows, botRows, aiReferralSourceRows, humanSourceRows };
+    }));
+
+    const humanRows = perTarget.flatMap((t) => t.humanRows);
+    const botRows = perTarget.flatMap((t) => t.botRows);
+
+    // Same referrer name can appear from both instances (e.g. "ChatGPT" on
+    // both) — sum them into one entry instead of showing duplicate rows.
+    function mergeCountsByName(rowSets) {
+      const m = new Map();
+      for (const r of rowSets) m.set(r.name, (m.get(r.name) || 0) + Number(r.n));
+      return Array.from(m.entries())
+        .map(([name, n]) => ({ name, n }))
+        .sort((a, b) => b.n - a.n);
+    }
+    const aiReferralSourceRows = mergeCountsByName(perTarget.flatMap((t) => t.aiReferralSourceRows));
+    const humanSourceRows = mergeCountsByName(perTarget.flatMap((t) => t.humanSourceRows));
 
     const byDay = new Map();
     const totals = { human: 0, ai_referral: 0, google: 0, bing: 0, ai: 0, other_bot: 0 };
@@ -210,7 +303,7 @@ app.get('/api/matomo/summary', async (req, res) => {
     };
     const humanSources = topNWithOther(humanSourceRows, 6);
 
-    res.json({ from, to, siteId: siteId ?? 'all', days, totals, total, aiReferralSources, humanSources });
+    res.json({ from, to, siteId: rawSiteId || 'all', days, totals, total, aiReferralSources, humanSources });
   } catch (err) {
     console.error('Matomo /summary error:', err.message);
     res.status(500).json({ error: err.message });
@@ -219,11 +312,10 @@ app.get('/api/matomo/summary', async (req, res) => {
 
 app.get('/api/matomo/visits', async (req, res) => {
   try {
-    const pool = getMatomoPool();
+    const instances = getMatomoInstances();
     const from = parseDateParam(req.query.from, daysAgo(29));
     const to = parseDateParam(req.query.to, isoDate(new Date()));
-    const rawSiteId = req.query.siteId;
-    const siteId = rawSiteId && rawSiteId !== 'all' ? clampInt(rawSiteId, null, 1, 2 ** 31 - 1) : null;
+    const targets = resolveInstanceTargets(req.query.siteId, instances);
     const category = CATEGORIES.includes(req.query.category) ? req.query.category : null;
     // Optional exact-match refinement on top of category, e.g. category=human&source=Google
     // for "people who came via Google search" as opposed to Googlebot crawl requests.
@@ -246,77 +338,94 @@ app.get('/api/matomo/visits', async (req, res) => {
       actions: 'actions',
     };
     const sortColumn = SORT_COLUMNS[req.query.sortBy] || 'event_time';
-    const sortDir = req.query.sortDir === 'asc' ? 'ASC' : 'DESC';
+    const dirAsc = req.query.sortDir === 'asc';
+    const sortDirSql = dirAsc ? 'ASC' : 'DESC';
     const orderBySql = sortColumn === 'event_time'
-      ? `ORDER BY event_time ${sortDir}`
-      : `ORDER BY ${sortColumn} ${sortDir}, event_time DESC`;
+      ? `ORDER BY event_time ${sortDirSql}`
+      : `ORDER BY ${sortColumn} ${sortDirSql}, event_time DESC`;
 
-    const humanSiteFilter = siteId ? 'AND v.idsite = ?' : '';
-    const botSiteFilter = siteId ? 'AND b.idsite = ?' : '';
-    const humanParams = [from, to, ...(siteId ? [siteId] : [])];
-    const botParams = [from, to, ...(siteId ? [siteId] : [])];
-
-    // Human visits (log_visit) and bot requests (log_bot_request) are different
-    // grain (a session vs. a single crawled URL) but are unioned into one
-    // timeline so the table matches what was asked for: everyone who touched the site.
-    const unionSql = `
-      SELECT
-        v.idvisit AS id,
-        ${HUMAN_CATEGORY_CASE_SQL} AS category,
-        v.visit_last_action_time AS event_time,
-        TRIM(CONCAT(COALESCE(v.config_browser_name,''), ' ', COALESCE(v.config_browser_version,''))) AS detail,
-        v.config_os AS extra,
-        v.config_device_type AS device_type,
-        v.referer_name AS source_or_url,
-        v.location_country AS country,
-        NULL AS http_status,
-        INET6_NTOA(v.location_ip) AS ip,
-        v.visit_total_actions AS actions
-      FROM ${matomoTable('log_visit')} v
-      WHERE v.visit_last_action_time >= ? AND v.visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
-      ${humanSiteFilter}
-
-      UNION ALL
-
-      SELECT
-        b.idrequest AS id,
-        ${botCategoryCaseSql('b.bot_name')} AS category,
-        b.server_time AS event_time,
-        b.bot_name AS detail,
-        b.bot_type AS extra,
-        NULL AS device_type,
-        COALESCE(la.name, b.source) AS source_or_url,
-        NULL AS country,
-        b.http_status_code AS http_status,
-        NULL AS ip,
-        NULL AS actions
-      FROM ${matomoTable('log_bot_request')} b
-      LEFT JOIN ${matomoTable('log_action')} la ON la.idaction = b.idaction_url
-      WHERE b.server_time >= ? AND b.server_time < DATE_ADD(?, INTERVAL 1 DAY)
-      ${botSiteFilter}
-    `;
-    const unionParams = [...humanParams, ...botParams];
     const filterClauses = [];
     const filterParams = [];
     if (category) { filterClauses.push('category = ?'); filterParams.push(category); }
     if (source) { filterClauses.push('source_or_url = ?'); filterParams.push(source); }
     const filterSql = filterClauses.length ? `WHERE ${filterClauses.join(' AND ')}` : '';
 
-    const [countRows] = await pool.query(
-      `SELECT COUNT(*) AS cnt FROM (${unionSql}) t ${filterSql}`,
-      [...unionParams, ...filterParams]
-    );
-    const [rows] = await pool.query(
-      `SELECT * FROM (${unionSql}) t ${filterSql} ${orderBySql} LIMIT ? OFFSET ?`,
-      [...unionParams, ...filterParams, pageSize, offset]
-    );
+    // Each instance is queried independently (its own indexed connection),
+    // sorted/limited the same way, then the results are merged and re-sorted
+    // here in JS before slicing out the requested page. Capped so a deep page
+    // number on a multi-instance "all sites" view can't force a huge per-DB fetch.
+    const perInstanceLimit = Math.min(offset + pageSize, 20000);
+
+    const perTarget = await Promise.all(targets.map(async ({ instance, idsite }) => {
+      const pool = getPool(instance);
+      const humanSiteFilter = idsite ? 'AND v.idsite = ?' : '';
+      const botSiteFilter = idsite ? 'AND b.idsite = ?' : '';
+      const humanParams = [from, to, ...(idsite ? [idsite] : [])];
+      const botParams = [from, to, ...(idsite ? [idsite] : [])];
+
+      // Human visits (log_visit) and bot requests (log_bot_request) are different
+      // grain (a session vs. a single crawled URL) but are unioned into one
+      // timeline so the table matches what was asked for: everyone who touched the site.
+      const unionSql = `
+        SELECT
+          v.idvisit AS id,
+          ${HUMAN_CATEGORY_CASE_SQL} AS category,
+          v.visit_last_action_time AS event_time,
+          TRIM(CONCAT(COALESCE(v.config_browser_name,''), ' ', COALESCE(v.config_browser_version,''))) AS detail,
+          v.config_os AS extra,
+          v.config_device_type AS device_type,
+          v.referer_name AS source_or_url,
+          v.location_country AS country,
+          NULL AS http_status,
+          INET6_NTOA(v.location_ip) AS ip,
+          v.visit_total_actions AS actions
+        FROM ${matomoTable(instance, 'log_visit')} v
+        WHERE v.visit_last_action_time >= ? AND v.visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
+        ${humanSiteFilter}
+
+        UNION ALL
+
+        SELECT
+          b.idrequest AS id,
+          ${botCategoryCaseSql('b.bot_name')} AS category,
+          b.server_time AS event_time,
+          b.bot_name AS detail,
+          b.bot_type AS extra,
+          NULL AS device_type,
+          COALESCE(la.name, b.source) AS source_or_url,
+          NULL AS country,
+          b.http_status_code AS http_status,
+          NULL AS ip,
+          NULL AS actions
+        FROM ${matomoTable(instance, 'log_bot_request')} b
+        LEFT JOIN ${matomoTable(instance, 'log_action')} la ON la.idaction = b.idaction_url
+        WHERE b.server_time >= ? AND b.server_time < DATE_ADD(?, INTERVAL 1 DAY)
+        ${botSiteFilter}
+      `;
+      const unionParams = [...humanParams, ...botParams];
+
+      const [countRows] = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM (${unionSql}) t ${filterSql}`,
+        [...unionParams, ...filterParams]
+      );
+      const [rows] = await pool.query(
+        `SELECT * FROM (${unionSql}) t ${filterSql} ${orderBySql} LIMIT ?`,
+        [...unionParams, ...filterParams, perInstanceLimit]
+      );
+      return { count: Number(countRows[0].cnt), rows: rows.map((r) => ({ ...r, __instance: instance.id })) };
+    }));
+
+    const total = perTarget.reduce((a, t) => a + t.count, 0);
+    const merged = perTarget.flatMap((t) => t.rows);
+    merged.sort((a, b) => compareRawRows(a, b, sortColumn, dirAsc));
+    const pageRows = merged.slice(offset, offset + pageSize);
 
     res.json({
       page,
       pageSize,
-      total: countRows[0].cnt,
-      rows: rows.map((r) => ({
-        id: r.id,
+      total,
+      rows: pageRows.map((r) => ({
+        id: `${r.__instance}:${r.id}`,
         category: r.category,
         time: r.event_time,
         detail: r.detail,
@@ -327,10 +436,120 @@ app.get('/api/matomo/visits', async (req, res) => {
         httpStatus: r.http_status,
         ip: r.ip,
         actions: r.actions,
+        instance: r.__instance,
       })),
     });
   } catch (err) {
     console.error('Matomo /visits error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================================================
+   Matomo — cross-site overview table
+   (загальна таблиця по всіх сайтах: трафік за вчора / 7 днів / 30 днів)
+
+   matomo_log_visit's only indexes are (idsite, ...) composites, so a scan
+   across ALL sites for a date range can't use any of them and falls back to
+   a full table scan (~30s per window on this DB, regardless of window size —
+   confirmed empirically). Doing that on every page load would hammer the
+   client's live production Matomo DB. So this is computed once and cached
+   in memory for CACHE_TTL_MS; concurrent requests during a (re)compute share
+   the same in-flight promise instead of triggering duplicate scans.
+   Ideal real fix: add `CREATE INDEX idx_visit_time ON matomo_log_visit
+   (visit_last_action_time)` on their DB (and the equivalent on
+   log_bot_request.server_time) — ask before doing that, it's their prod DB.
+========================================================= */
+
+const OVERVIEW_CACHE_TTL_MS = 20 * 60 * 1000; // 20 minutes
+let overviewCache = { data: null, computedAt: 0 };
+let overviewComputing = null;
+
+async function computeSitesOverviewForInstance(instance) {
+  const pool = getPool(instance);
+
+  const windows = {
+    yesterday: [daysAgo(1), daysAgo(0)],
+    last7: [daysAgo(7), daysAgo(0)],
+    last30: [daysAgo(30), daysAgo(0)],
+  };
+
+  const [sitesRows, ...windowResults] = await Promise.all([
+    pool.query(`SELECT idsite, name FROM ${matomoTable(instance, 'site')} ORDER BY name`).then(([r]) => r),
+    ...Object.values(windows).map(([from, to]) =>
+      pool.query(
+        `SELECT idsite,
+           COUNT(*) AS total,
+           SUM(referer_type = 2) AS search,
+           SUM(referer_type = 2 AND referer_name = 'Google') AS google,
+           SUM(referer_type = 2 AND referer_name = 'Bing') AS bing,
+           SUM(referer_type = 2 AND referer_name = 'Yahoo!') AS yahoo,
+           SUM(referer_type = 8) AS ai
+         FROM ${matomoTable(instance, 'log_visit')}
+         WHERE visit_last_action_time >= ? AND visit_last_action_time < ?
+         GROUP BY idsite`,
+        [from, to]
+      ).then(([r]) => r)
+    ),
+  ]);
+
+  const windowKeys = Object.keys(windows);
+  const emptyMetrics = () => ({ total: 0, search: 0, google: 0, bing: 0, yahoo: 0, ai: 0 });
+  const byIdsite = new Map(sitesRows.map((s) => [s.idsite, {
+    siteId: compositeSiteId(instance, s.idsite),
+    name: s.name,
+    instance: instance.id,
+    instanceLabel: instance.label,
+    yesterday: emptyMetrics(), last7: emptyMetrics(), last30: emptyMetrics(),
+  }]));
+
+  windowKeys.forEach((key, i) => {
+    for (const row of windowResults[i]) {
+      const site = byIdsite.get(row.idsite);
+      if (!site) continue; // site was deleted from matomo_site but has old log rows
+      site[key] = {
+        total: Number(row.total), search: Number(row.search), google: Number(row.google),
+        bing: Number(row.bing), yahoo: Number(row.yahoo), ai: Number(row.ai),
+      };
+    }
+  });
+
+  return Array.from(byIdsite.values());
+}
+
+async function computeSitesOverview() {
+  const instances = getMatomoInstances();
+  const settled = await Promise.allSettled(instances.map((i) => computeSitesOverviewForInstance(i)));
+  const sites = [];
+  for (const s of settled) {
+    if (s.status === 'fulfilled') sites.push(...s.value);
+    else console.error('Matomo sites-overview instance error:', s.reason?.message);
+  }
+  return sites;
+}
+
+app.get('/api/matomo/sites-overview', async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const isFresh = overviewCache.data && (Date.now() - overviewCache.computedAt) < OVERVIEW_CACHE_TTL_MS;
+
+    if (isFresh && !forceRefresh) {
+      return res.json({ sites: overviewCache.data, computedAt: overviewCache.computedAt, cached: true });
+    }
+
+    if (!overviewComputing) {
+      overviewComputing = computeSitesOverview()
+        .then((data) => {
+          overviewCache = { data, computedAt: Date.now() };
+          return data;
+        })
+        .finally(() => { overviewComputing = null; });
+    }
+
+    const data = await overviewComputing;
+    res.json({ sites: data, computedAt: overviewCache.computedAt, cached: false });
+  } catch (err) {
+    console.error('Matomo /sites-overview error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

@@ -2396,6 +2396,197 @@ function matomoDaysAgo(n) {
   return d.toISOString().slice(0, 10);
 }
 
+const MATOMO_OVERVIEW_WINDOWS = [
+  { key: "yesterday", label: "Вчора" },
+  { key: "last7", label: "Останні 7 днів" },
+  { key: "last30", label: "Останні 30 днів" },
+];
+const MATOMO_OVERVIEW_METRICS = [
+  { key: "total", label: "Всього" },
+  { key: "search", label: "Пошук" },
+  { key: "google", label: "Google" },
+  { key: "bing", label: "Bing" },
+  { key: "yahoo", label: "Yahoo" },
+  { key: "ai", label: "AI" },
+];
+
+function matomoMinutesAgo(ts) {
+  if (!ts) return null;
+  const min = Math.max(0, Math.round((Date.now() - ts) / 60000));
+  if (min < 1) return "щойно";
+  if (min < 60) return `${min} хв тому`;
+  const h = Math.round(min / 60);
+  return `${h} год тому`;
+}
+
+function MatomoSitesOverviewPanel() {
+  const [open, setOpen] = useState(false);
+  const [sites, setSites] = useState(null);
+  const [computedAt, setComputedAt] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [search, setSearch] = useState("");
+  const [sortKey, setSortKey] = useState("last30.total");
+  const [sortDir, setSortDir] = useState("desc");
+  const [page, setPage] = useState(1);
+  const pageSize = 30;
+
+  function load(refresh) {
+    setLoading(true); setError(null);
+    const params = refresh ? "?refresh=1" : "";
+    fetch(`${MATOMO_API_BASE}/api/matomo/sites-overview${params}`)
+      .then(async (r) => { const d = await r.json(); if (!r.ok) throw new Error(d.error || "Помилка запиту"); return d; })
+      .then((d) => { setSites(d.sites); setComputedAt(d.computedAt); })
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    if (!open || sites) return;
+    load(false);
+  }, [open]);
+
+  useEffect(() => { setPage(1); }, [search, sortKey, sortDir]);
+
+  function toggleSort(key) {
+    if (sortKey === key) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir("desc");
+    }
+  }
+
+  function metricValue(site, key) {
+    if (key === "name") return site.name;
+    const [win, m] = key.split(".");
+    return site[win]?.[m] ?? 0;
+  }
+
+  const multiInstance = new Set((sites || []).map((s) => s.instance)).size > 1;
+  const filtered = (sites || []).filter((s) => s.name.toLowerCase().includes(search.trim().toLowerCase()));
+  const sorted = [...filtered].sort((a, b) => {
+    const av = metricValue(a, sortKey), bv = metricValue(b, sortKey);
+    const cmp = typeof av === "string" ? av.localeCompare(bv) : av - bv;
+    return sortDir === "asc" ? cmp : -cmp;
+  });
+  const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
+  const pageRows = sorted.slice((page - 1) * pageSize, page * pageSize);
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-5 md:col-span-2">
+      <button type="button" className="flex w-full items-center justify-between text-left" onClick={() => setOpen((o) => !o)}>
+        <div className="flex items-center gap-2">
+          <Globe className="h-4 w-4 text-sky-600" />
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Загальна таблиця по всіх сайтах (Matomo)</h3>
+        </div>
+        <span className="text-xs text-slate-400">{open ? "Згорнути ▲" : "Показати ▼"}</span>
+      </button>
+      <p className="mt-1 text-xs text-slate-300 leading-relaxed">
+        💡 Трафік по кожному сайту за вчора / 7 днів / 30 днів: всього, з пошуку, окремо Google/Bing/Yahoo, і з AI-рефералів. Дані кешуються — перерахунок важкий (~30с) для БД з {(sites?.length ?? "багатьма").toString()} сайтами, тож оновлюється не миттєво.
+      </p>
+
+      {open && (
+        <div className="mt-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Пошук домену…"
+              className="rounded-md border border-slate-300 px-2 py-1 text-sm"
+            />
+            <div className="flex items-center gap-2 text-xs text-slate-400">
+              {computedAt && <span>Оновлено {matomoMinutesAgo(computedAt)}</span>}
+              <button
+                type="button"
+                disabled={loading}
+                onClick={() => load(true)}
+                title="Повний перерахунок займає ~30 секунд"
+                className="flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50 disabled:opacity-50"
+              >
+                {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+                Оновити
+              </button>
+            </div>
+          </div>
+
+          {error && <p className="text-xs text-red-600">⚠️ {error}</p>}
+          {loading && !sites && <p className="text-xs text-slate-400">Рахую по всіх сайтах, це займає близько 30 секунд…</p>}
+
+          {sites && (
+            <>
+              <div className="overflow-x-auto rounded-md border border-slate-200">
+                <table className="min-w-full text-xs">
+                  <thead className="bg-slate-50 text-slate-500">
+                    <tr>
+                      <th rowSpan={2} className="sticky left-0 z-10 bg-slate-50 px-2 py-1.5 text-left align-bottom">
+                        <button type="button" onClick={() => toggleSort("name")} className="hover:text-slate-700">
+                          Сайт {sortKey === "name" ? (sortDir === "asc" ? "▲" : "▼") : ""}
+                        </button>
+                      </th>
+                      {MATOMO_OVERVIEW_WINDOWS.map((w) => (
+                        <th key={w.key} colSpan={MATOMO_OVERVIEW_METRICS.length} className="border-l border-slate-200 px-2 py-1 text-center font-semibold">
+                          {w.label}
+                        </th>
+                      ))}
+                    </tr>
+                    <tr>
+                      {MATOMO_OVERVIEW_WINDOWS.map((w) => (
+                        MATOMO_OVERVIEW_METRICS.map((m, i) => {
+                          const key = `${w.key}.${m.key}`;
+                          const active = sortKey === key;
+                          return (
+                            <th
+                              key={key}
+                              onClick={() => toggleSort(key)}
+                              className={`cursor-pointer select-none whitespace-nowrap px-2 py-1 text-right hover:text-slate-700 ${i === 0 ? "border-l border-slate-200" : ""} ${active ? "text-slate-800" : ""}`}
+                            >
+                              {m.label} {active ? (sortDir === "asc" ? "▲" : "▼") : ""}
+                            </th>
+                          );
+                        })
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageRows.map((s) => (
+                      <tr key={s.siteId} className="border-t border-slate-100 hover:bg-slate-50">
+                        <td className="sticky left-0 z-10 bg-white px-2 py-1.5 font-medium text-slate-700">
+                          {s.name}
+                          {multiInstance && <span className="ml-1 text-[10px] text-slate-300">({s.instanceLabel})</span>}
+                        </td>
+                        {MATOMO_OVERVIEW_WINDOWS.map((w) => (
+                          MATOMO_OVERVIEW_METRICS.map((m, i) => (
+                            <td key={`${w.key}.${m.key}`} className={`px-2 py-1.5 text-right font-mono text-slate-500 ${i === 0 ? "border-l border-slate-100 text-slate-700" : ""}`}>
+                              {(s[w.key]?.[m.key] ?? 0).toLocaleString("uk-UA")}
+                            </td>
+                          ))
+                        ))}
+                      </tr>
+                    ))}
+                    {pageRows.length === 0 && (
+                      <tr><td colSpan={1 + MATOMO_OVERVIEW_WINDOWS.length * MATOMO_OVERVIEW_METRICS.length} className="px-2 py-6 text-center text-slate-400">Нічого не знайдено за «{search}».</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="flex items-center justify-between text-xs text-slate-500">
+                <span>Знайдено {sorted.length.toLocaleString("uk-UA")} сайтів (з {sites.length.toLocaleString("uk-UA")}) · сторінка {page} з {totalPages}</span>
+                <div className="flex gap-1">
+                  <button type="button" disabled={page <= 1} onClick={() => setPage((p) => p - 1)} className="rounded-md border border-slate-200 px-2 py-1 disabled:opacity-40">← Назад</button>
+                  <button type="button" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)} className="rounded-md border border-slate-200 px-2 py-1 disabled:opacity-40">Далі →</button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MatomoSortTh({ column, label, align = "left", sortBy, sortDir, onSort }) {
   const active = sortBy === column;
   return (
@@ -2479,6 +2670,7 @@ function MatomoLogPanel() {
   const totals = summary?.totals;
   const total = summary?.total || 0;
   const totalPages = visits ? Math.max(1, Math.ceil(visits.total / pageSize)) : 1;
+  const sitesMultiInstance = new Set(sites.map((s) => s.instance)).size > 1;
 
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-5 md:col-span-2">
@@ -2500,7 +2692,18 @@ function MatomoLogPanel() {
               <label className="block text-[11px] text-slate-400">Сайт</label>
               <select value={siteId} onChange={(e) => setSiteId(e.target.value)} className="mt-0.5 rounded-md border border-slate-300 px-2 py-1 text-sm">
                 <option value="all">Усі сайти</option>
-                {sites.map((s) => <option key={s.idsite} value={s.idsite}>{s.name}</option>)}
+                {sitesMultiInstance
+                  ? Object.entries(
+                      sites.reduce((groups, s) => {
+                        (groups[s.instanceLabel] ||= []).push(s);
+                        return groups;
+                      }, {})
+                    ).map(([label, group]) => (
+                      <optgroup key={label} label={label}>
+                        {group.map((s) => <option key={s.siteId} value={s.siteId}>{s.name}</option>)}
+                      </optgroup>
+                    ))
+                  : sites.map((s) => <option key={s.siteId} value={s.siteId}>{s.name}</option>)}
               </select>
             </div>
             <div>
@@ -14028,6 +14231,7 @@ ${JSON.stringify(summary)}`;
 
           {/* ── Відвідування (Matomo) ───────────────────── */}
           <div id="toc-dt-matomo" className="contents">
+          <MatomoSitesOverviewPanel />
           <MatomoLogPanel />
           </div>
 
