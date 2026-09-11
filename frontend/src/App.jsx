@@ -2400,6 +2400,7 @@ const MATOMO_OVERVIEW_WINDOWS = [
   { key: "yesterday", label: "Вчора" },
   { key: "last7", label: "Останні 7 днів" },
   { key: "last30", label: "Останні 30 днів" },
+  { key: "allTime", label: "За весь період" },
 ];
 const MATOMO_OVERVIEW_METRICS = [
   { key: "total", label: "Всього" },
@@ -2472,6 +2473,16 @@ function MatomoSitesOverviewPanel() {
   });
   const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
   const pageRows = sorted.slice((page - 1) * pageSize, page * pageSize);
+
+  // Grand totals across every currently filtered site (not just the visible page) —
+  // "загальні сумарні значення по всіх сайтах" boss asked for.
+  const grandTotals = MATOMO_OVERVIEW_WINDOWS.reduce((acc, w) => {
+    acc[w.key] = MATOMO_OVERVIEW_METRICS.reduce((m, metric) => {
+      m[metric.key] = filtered.reduce((sum, s) => sum + (s[w.key]?.[metric.key] || 0), 0);
+      return m;
+    }, {});
+    return acc;
+  }, {});
 
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-5 md:col-span-2">
@@ -2550,6 +2561,18 @@ function MatomoSitesOverviewPanel() {
                     </tr>
                   </thead>
                   <tbody>
+                    <tr className="border-t border-b-2 border-slate-200 bg-slate-100 font-semibold">
+                      <td className="sticky left-0 z-10 bg-slate-100 px-2 py-1.5 text-slate-800">
+                        Всього ({filtered.length.toLocaleString("uk-UA")} {search.trim() ? "знайдених" : "сайтів"})
+                      </td>
+                      {MATOMO_OVERVIEW_WINDOWS.map((w) => (
+                        MATOMO_OVERVIEW_METRICS.map((m, i) => (
+                          <td key={`total-${w.key}.${m.key}`} className={`px-2 py-1.5 text-right font-mono text-slate-800 ${i === 0 ? "border-l border-slate-200" : ""}`}>
+                            {(grandTotals[w.key]?.[m.key] ?? 0).toLocaleString("uk-UA")}
+                          </td>
+                        ))
+                      ))}
+                    </tr>
                     {pageRows.map((s) => (
                       <tr key={s.siteId} className="border-t border-slate-100 hover:bg-slate-50">
                         <td className="sticky left-0 z-10 bg-white px-2 py-1.5 font-medium text-slate-700">
@@ -2607,8 +2630,11 @@ function MatomoLogPanel() {
   const [open, setOpen] = useState(false);
   const [sites, setSites] = useState([]);
   const [siteId, setSiteId] = useState("all");
-  const [from, setFrom] = useState(matomoDaysAgo(29));
-  const [to, setTo] = useState(matomoDaysAgo(0));
+  // "До вчора включно" за замовчуванням — узгоджено з "Загальною таблицею по всіх
+  // сайтах", де вікна теж виключають сьогоднішній ще не завершений день. Інакше
+  // ті самі "останні 7/30 днів" тут і там рахують різні діапазони і суми не сходяться.
+  const [from, setFrom] = useState(matomoDaysAgo(30));
+  const [to, setTo] = useState(matomoDaysAgo(1));
 
   const [summary, setSummary] = useState(null);
   const [loadingSummary, setLoadingSummary] = useState(false);
@@ -2641,30 +2667,39 @@ function MatomoLogPanel() {
       .catch(() => {});
   }, [open]);
 
+  // "Усі сайти" is a much heavier query (full table scan) than one specific
+  // site (uses the idsite index), so it can easily still be in flight when the
+  // user picks a site and a faster, newer request already resolved. Without a
+  // staleness guard the slow "all" response lands last and overwrites the
+  // correct data — a real race condition, not a one-off glitch.
+  const summaryRequestId = useRef(0);
   useEffect(() => {
     if (!open) return;
+    const requestId = ++summaryRequestId.current;
     setLoadingSummary(true); setSummaryError(null);
     const params = new URLSearchParams({ from, to, siteId });
     fetch(`${MATOMO_API_BASE}/api/matomo/summary?${params}`)
       .then(async (r) => { const d = await r.json(); if (!r.ok) throw new Error(d.error || "Помилка запиту"); return d; })
-      .then(setSummary)
-      .catch((err) => setSummaryError(err.message))
-      .finally(() => setLoadingSummary(false));
+      .then((d) => { if (requestId === summaryRequestId.current) setSummary(d); })
+      .catch((err) => { if (requestId === summaryRequestId.current) setSummaryError(err.message); })
+      .finally(() => { if (requestId === summaryRequestId.current) setLoadingSummary(false); });
   }, [open, from, to, siteId]);
 
   useEffect(() => { setPage(1); }, [from, to, siteId, filterKey, sortBy, sortDir]);
 
+  const visitsRequestId = useRef(0);
   useEffect(() => {
     if (!open) return;
+    const requestId = ++visitsRequestId.current;
     setLoadingVisits(true); setVisitsError(null);
     const params = new URLSearchParams({ from, to, siteId, page: String(page), pageSize: String(pageSize), sortBy, sortDir });
     if (activeChip.category) params.set("category", activeChip.category);
     if (activeChip.source) params.set("source", activeChip.source);
     fetch(`${MATOMO_API_BASE}/api/matomo/visits?${params}`)
       .then(async (r) => { const d = await r.json(); if (!r.ok) throw new Error(d.error || "Помилка запиту"); return d; })
-      .then(setVisits)
-      .catch((err) => setVisitsError(err.message))
-      .finally(() => setLoadingVisits(false));
+      .then((d) => { if (requestId === visitsRequestId.current) setVisits(d); })
+      .catch((err) => { if (requestId === visitsRequestId.current) setVisitsError(err.message); })
+      .finally(() => { if (requestId === visitsRequestId.current) setLoadingVisits(false); });
   }, [open, from, to, siteId, filterKey, page, sortBy, sortDir]);
 
   const totals = summary?.totals;
@@ -2717,7 +2752,7 @@ function MatomoLogPanel() {
             <div className="flex gap-1">
               {[7, 30, 90].map((n) => (
                 <button key={n} type="button"
-                  onClick={() => { setFrom(matomoDaysAgo(n - 1)); setTo(matomoDaysAgo(0)); }}
+                  onClick={() => { setFrom(matomoDaysAgo(n)); setTo(matomoDaysAgo(1)); }}
                   className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50">
                   {n} дн.
                 </button>

@@ -49,6 +49,11 @@ function buildMatomoInstances() {
       password: process.env[`MATOMO${suffix}_DB_PASSWORD`],
       database: process.env[`MATOMO${suffix}_DB_NAME`],
       tablePrefix: process.env[`MATOMO${suffix}_TABLE_PREFIX`] || 'matomo_',
+      // Every site inside one Matomo installation shares one timezone (confirmed
+      // empirically: all sites on instance 1 = America/Chicago, all on instance 2 =
+      // UTC-4). Matomo's own UI buckets "today"/date ranges by that local calendar
+      // day, not UTC — so this is needed to make our numbers match theirs.
+      timezone: process.env[`MATOMO${suffix}_TIMEZONE`] || 'UTC',
       pool: null,
     });
   }
@@ -89,6 +94,83 @@ function matomoTable(instance, name) {
 
 function compositeSiteId(instance, idsite) {
   return `${instance.id}:${idsite}`;
+}
+
+// ---- Timezone-aware date-boundary helpers ----
+// visit_last_action_time / server_time are stored in UTC, but Matomo's own UI
+// buckets "today" / "yesterday" / a date range by each site's LOCAL calendar
+// day. A naive UTC-midnight boundary drifts visits across day/period edges and
+// produces totals that don't match the native Matomo reports (confirmed: a
+// UTC-4 site's "last 7 days" differed from ours by ~170 visits until this was
+// added). These helpers convert a local calendar date (in the instance's
+// timezone) to the correct UTC instant.
+
+function parseFixedUtcOffsetMinutes(tz) {
+  const m = /^UTC([+-]\d{1,2}(?::?\d{2})?)?$/i.exec(String(tz).trim());
+  if (!m) return null;
+  if (!m[1]) return 0;
+  const sign = m[1][0] === '-' ? -1 : 1;
+  const rest = m[1].slice(1).replace(':', '');
+  const hours = parseInt(rest.slice(0, 2), 10);
+  const minutes = rest.length > 2 ? parseInt(rest.slice(2), 10) : 0;
+  return sign * (hours * 60 + minutes);
+}
+
+// (local - UTC) in minutes, positive when local is ahead of UTC. Handles both
+// fixed offsets ("UTC-4") and DST-aware IANA zones ("America/Chicago").
+function tzOffsetMinutesAt(utcDate, timeZone) {
+  const fixed = parseFixedUtcOffsetMinutes(timeZone);
+  if (fixed !== null) return fixed;
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const p = dtf.formatToParts(utcDate).reduce((a, x) => { a[x.type] = x.value; return a; }, {});
+  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+  return (asUTC - utcDate.getTime()) / 60000;
+}
+
+// The UTC instant of local midnight for "YYYY-MM-DD" in `timeZone`.
+function zonedMidnightUTC(dateStr, timeZone) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const naiveUTC = Date.UTC(y, m - 1, d, 0, 0, 0);
+  const offset1 = tzOffsetMinutesAt(new Date(naiveUTC), timeZone);
+  let instant = naiveUTC - offset1 * 60000;
+  const offset2 = tzOffsetMinutesAt(new Date(instant), timeZone);
+  if (offset2 !== offset1) instant = naiveUTC - offset2 * 60000; // DST-transition correction
+  return new Date(instant);
+}
+
+function todayInZone(timeZone) {
+  const fixed = parseFixedUtcOffsetMinutes(timeZone);
+  const now = new Date();
+  if (fixed !== null) return new Date(now.getTime() + fixed * 60000).toISOString().slice(0, 10);
+  return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+}
+
+function addDaysToDateStr(dateStr, days) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+function daysAgoInZone(n, timeZone) {
+  return addDaysToDateStr(todayInZone(timeZone), -n);
+}
+
+function formatSqlDateTime(date) {
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+// Inclusive "YYYY-MM-DD" calendar range (in the instance's timezone) as UTC SQL
+// datetime bounds to use as: >= fromSql AND < toSqlExclusive.
+function instanceDateRangeSql(instance, fromStr, toStr) {
+  return {
+    fromSql: formatSqlDateTime(zonedMidnightUTC(fromStr, instance.timezone)),
+    toSqlExclusive: formatSqlDateTime(zonedMidnightUTC(addDaysToDateStr(toStr, 1), instance.timezone)),
+  };
 }
 
 // Resolves the "siteId" query param into concrete (instance, idsite) targets to
@@ -203,27 +285,31 @@ app.get('/api/matomo/summary', async (req, res) => {
 
     const perTarget = await Promise.all(targets.map(async ({ instance, idsite }) => {
       const pool = getPool(instance);
-      const humanSiteFilter = idsite ? 'AND idsite = ?' : '';
-      const humanParams = [from, to, ...(idsite ? [idsite] : [])];
-      const botSiteFilter = idsite ? 'AND idsite = ?' : '';
-      const botParams = [from, to, ...(idsite ? [idsite] : [])];
+      const { fromSql, toSqlExclusive } = instanceDateRangeSql(instance, from, to);
+      // Used to shift visit_last_action_time before DATE() so daily buckets line
+      // up with the instance's local calendar day, not UTC's.
+      const offsetMin = tzOffsetMinutesAt(new Date(), instance.timezone);
+      const idsiteFilter = idsite ? 'AND idsite = ?' : '';
+      const idsiteParam = idsite ? [idsite] : [];
+      const rangeParams = [fromSql, toSqlExclusive, ...idsiteParam];
+      const dayBucketParams = [offsetMin, fromSql, toSqlExclusive, ...idsiteParam];
 
       const [humanRows] = await pool.query(
-        `SELECT DATE(visit_last_action_time) AS day, ${HUMAN_CATEGORY_CASE_SQL} AS category, COUNT(*) AS n
+        `SELECT DATE(DATE_ADD(visit_last_action_time, INTERVAL ? MINUTE)) AS day, ${HUMAN_CATEGORY_CASE_SQL} AS category, COUNT(*) AS n
          FROM ${matomoTable(instance, 'log_visit')}
-         WHERE visit_last_action_time >= ? AND visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
-         ${humanSiteFilter}
+         WHERE visit_last_action_time >= ? AND visit_last_action_time < ?
+         ${idsiteFilter}
          GROUP BY day, category`,
-        humanParams
+        dayBucketParams
       );
 
       const [botRows] = await pool.query(
-        `SELECT DATE(server_time) AS day, ${botCategoryCaseSql('bot_name')} AS category, COUNT(*) AS n
+        `SELECT DATE(DATE_ADD(server_time, INTERVAL ? MINUTE)) AS day, ${botCategoryCaseSql('bot_name')} AS category, COUNT(*) AS n
          FROM ${matomoTable(instance, 'log_bot_request')}
-         WHERE server_time >= ? AND server_time < DATE_ADD(?, INTERVAL 1 DAY)
-         ${botSiteFilter}
+         WHERE server_time >= ? AND server_time < ?
+         ${idsiteFilter}
          GROUP BY day, category`,
-        botParams
+        dayBucketParams
       );
 
       // Which specific AI platform (ChatGPT / Gemini / Claude / Perplexity / ...)
@@ -231,11 +317,11 @@ app.get('/api/matomo/summary', async (req, res) => {
       const [aiReferralSourceRows] = await pool.query(
         `SELECT referer_name AS name, COUNT(*) AS n
          FROM ${matomoTable(instance, 'log_visit')}
-         WHERE visit_last_action_time >= ? AND visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
+         WHERE visit_last_action_time >= ? AND visit_last_action_time < ?
          AND referer_type = 8
-         ${humanSiteFilter}
+         ${idsiteFilter}
          GROUP BY referer_name`,
-        humanParams
+        rangeParams
       );
 
       // Same idea for regular human visits: which search engine / site / direct
@@ -243,11 +329,11 @@ app.get('/api/matomo/summary', async (req, res) => {
       const [humanSourceRows] = await pool.query(
         `SELECT COALESCE(NULLIF(referer_name,''), 'Прямий вхід') AS name, COUNT(*) AS n
          FROM ${matomoTable(instance, 'log_visit')}
-         WHERE visit_last_action_time >= ? AND visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
+         WHERE visit_last_action_time >= ? AND visit_last_action_time < ?
          AND referer_type != 8
-         ${humanSiteFilter}
+         ${idsiteFilter}
          GROUP BY name`,
-        humanParams
+        rangeParams
       );
 
       return { humanRows, botRows, aiReferralSourceRows, humanSourceRows };
@@ -358,10 +444,11 @@ app.get('/api/matomo/visits', async (req, res) => {
 
     const perTarget = await Promise.all(targets.map(async ({ instance, idsite }) => {
       const pool = getPool(instance);
+      const { fromSql, toSqlExclusive } = instanceDateRangeSql(instance, from, to);
       const humanSiteFilter = idsite ? 'AND v.idsite = ?' : '';
       const botSiteFilter = idsite ? 'AND b.idsite = ?' : '';
-      const humanParams = [from, to, ...(idsite ? [idsite] : [])];
-      const botParams = [from, to, ...(idsite ? [idsite] : [])];
+      const humanParams = [fromSql, toSqlExclusive, ...(idsite ? [idsite] : [])];
+      const botParams = [fromSql, toSqlExclusive, ...(idsite ? [idsite] : [])];
 
       // Human visits (log_visit) and bot requests (log_bot_request) are different
       // grain (a session vs. a single crawled URL) but are unioned into one
@@ -380,7 +467,7 @@ app.get('/api/matomo/visits', async (req, res) => {
           INET6_NTOA(v.location_ip) AS ip,
           v.visit_total_actions AS actions
         FROM ${matomoTable(instance, 'log_visit')} v
-        WHERE v.visit_last_action_time >= ? AND v.visit_last_action_time < DATE_ADD(?, INTERVAL 1 DAY)
+        WHERE v.visit_last_action_time >= ? AND v.visit_last_action_time < ?
         ${humanSiteFilter}
 
         UNION ALL
@@ -399,7 +486,7 @@ app.get('/api/matomo/visits', async (req, res) => {
           NULL AS actions
         FROM ${matomoTable(instance, 'log_bot_request')} b
         LEFT JOIN ${matomoTable(instance, 'log_action')} la ON la.idaction = b.idaction_url
-        WHERE b.server_time >= ? AND b.server_time < DATE_ADD(?, INTERVAL 1 DAY)
+        WHERE b.server_time >= ? AND b.server_time < ?
         ${botSiteFilter}
       `;
       const unionParams = [...humanParams, ...botParams];
@@ -465,42 +552,59 @@ const OVERVIEW_CACHE_TTL_MS = 20 * 60 * 1000; // 20 minutes
 let overviewCache = { data: null, computedAt: 0 };
 let overviewComputing = null;
 
+const OVERVIEW_METRIC_SELECT_SQL = `
+  COUNT(*) AS total,
+  SUM(referer_type = 2) AS search,
+  SUM(referer_type = 2 AND referer_name = 'Google') AS google,
+  SUM(referer_type = 2 AND referer_name = 'Bing') AS bing,
+  SUM(referer_type = 2 AND referer_name = 'Yahoo!') AS yahoo,
+  SUM(referer_type = 8) AS ai
+`;
+
 async function computeSitesOverviewForInstance(instance) {
   const pool = getPool(instance);
-
-  const windows = {
-    yesterday: [daysAgo(1), daysAgo(0)],
-    last7: [daysAgo(7), daysAgo(0)],
-    last30: [daysAgo(30), daysAgo(0)],
+  // "Today"/"yesterday" etc. are calendar days in the instance's own timezone,
+  // then converted to UTC instants for the actual SQL bounds — same reasoning
+  // as instanceDateRangeSql above.
+  const todayStr = daysAgoInZone(0, instance.timezone);
+  const upperBoundSql = formatSqlDateTime(zonedMidnightUTC(todayStr, instance.timezone));
+  const boundedFromSql = {
+    yesterday: formatSqlDateTime(zonedMidnightUTC(daysAgoInZone(1, instance.timezone), instance.timezone)),
+    last7: formatSqlDateTime(zonedMidnightUTC(daysAgoInZone(7, instance.timezone), instance.timezone)),
+    last30: formatSqlDateTime(zonedMidnightUTC(daysAgoInZone(30, instance.timezone), instance.timezone)),
   };
 
-  const [sitesRows, ...windowResults] = await Promise.all([
+  const [sitesRows, boundedResults, allTimeRows] = await Promise.all([
     pool.query(`SELECT idsite, name FROM ${matomoTable(instance, 'site')} ORDER BY name`).then(([r]) => r),
-    ...Object.values(windows).map(([from, to]) =>
+    Promise.all(Object.values(boundedFromSql).map((fromSql) =>
       pool.query(
-        `SELECT idsite,
-           COUNT(*) AS total,
-           SUM(referer_type = 2) AS search,
-           SUM(referer_type = 2 AND referer_name = 'Google') AS google,
-           SUM(referer_type = 2 AND referer_name = 'Bing') AS bing,
-           SUM(referer_type = 2 AND referer_name = 'Yahoo!') AS yahoo,
-           SUM(referer_type = 8) AS ai
+        `SELECT idsite, ${OVERVIEW_METRIC_SELECT_SQL}
          FROM ${matomoTable(instance, 'log_visit')}
          WHERE visit_last_action_time >= ? AND visit_last_action_time < ?
          GROUP BY idsite`,
-        [from, to]
+        [fromSql, upperBoundSql]
       ).then(([r]) => r)
-    ),
+    )),
+    // "За весь період" — same metrics, no lower bound at all.
+    pool.query(
+      `SELECT idsite, ${OVERVIEW_METRIC_SELECT_SQL}
+       FROM ${matomoTable(instance, 'log_visit')}
+       WHERE visit_last_action_time < ?
+       GROUP BY idsite`,
+      [upperBoundSql]
+    ).then(([r]) => r),
   ]);
 
-  const windowKeys = Object.keys(windows);
+  const windowKeys = [...Object.keys(boundedFromSql), 'allTime'];
+  const windowResults = [...boundedResults, allTimeRows];
+
   const emptyMetrics = () => ({ total: 0, search: 0, google: 0, bing: 0, yahoo: 0, ai: 0 });
   const byIdsite = new Map(sitesRows.map((s) => [s.idsite, {
     siteId: compositeSiteId(instance, s.idsite),
     name: s.name,
     instance: instance.id,
     instanceLabel: instance.label,
-    yesterday: emptyMetrics(), last7: emptyMetrics(), last30: emptyMetrics(),
+    yesterday: emptyMetrics(), last7: emptyMetrics(), last30: emptyMetrics(), allTime: emptyMetrics(),
   }]));
 
   windowKeys.forEach((key, i) => {
