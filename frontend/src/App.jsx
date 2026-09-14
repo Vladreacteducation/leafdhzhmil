@@ -11,7 +11,7 @@ import {
 import {
   Upload, FileText, Link2, TrendingUp, TrendingDown, Sparkles, Loader2, Trash2,
   RefreshCw, Info, Calendar, X, CheckCircle2, Calculator, Activity,
-  Bell, AlertTriangle, Globe,
+  Bell, AlertTriangle, Globe, Download,
 } from "lucide-react";
 
 /* =========================================================
@@ -2484,6 +2484,41 @@ function MatomoSitesOverviewPanel() {
     return acc;
   }, {});
 
+  function exportToExcel() {
+    const headerRow1 = ["Сайт"];
+    const headerRow2 = ["Сайт"];
+    MATOMO_OVERVIEW_WINDOWS.forEach((w) => {
+      MATOMO_OVERVIEW_METRICS.forEach((m, i) => {
+        headerRow1.push(i === 0 ? w.label : "");
+        headerRow2.push(m.label);
+      });
+    });
+    const totalRow = [`Всього (${filtered.length})`];
+    MATOMO_OVERVIEW_WINDOWS.forEach((w) => {
+      MATOMO_OVERVIEW_METRICS.forEach((m) => totalRow.push(grandTotals[w.key]?.[m.key] ?? 0));
+    });
+    const dataRows = sorted.map((s) => {
+      const row = [multiInstance ? `${s.name} (${s.instanceLabel})` : s.name];
+      MATOMO_OVERVIEW_WINDOWS.forEach((w) => {
+        MATOMO_OVERVIEW_METRICS.forEach((m) => row.push(s[w.key]?.[m.key] ?? 0));
+      });
+      return row;
+    });
+
+    const ws = XLSX.utils.aoa_to_sheet([headerRow1, headerRow2, totalRow, ...dataRows]);
+    const merges = [];
+    let col = 1;
+    MATOMO_OVERVIEW_WINDOWS.forEach(() => {
+      merges.push({ s: { r: 0, c: col }, e: { r: 0, c: col + MATOMO_OVERVIEW_METRICS.length - 1 } });
+      col += MATOMO_OVERVIEW_METRICS.length;
+    });
+    ws["!merges"] = merges;
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Загальна таблиця");
+    XLSX.writeFile(wb, `matomo-zagalna-tablytsya-${matomoDaysAgo(0)}.xlsx`);
+  }
+
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-5 md:col-span-2">
       <button type="button" className="flex w-full items-center justify-between text-left" onClick={() => setOpen((o) => !o)}>
@@ -2509,6 +2544,16 @@ function MatomoSitesOverviewPanel() {
             />
             <div className="flex items-center gap-2 text-xs text-slate-400">
               {computedAt && <span>Оновлено {matomoMinutesAgo(computedAt)}</span>}
+              <button
+                type="button"
+                disabled={!sites?.length}
+                onClick={exportToExcel}
+                title="Вивантажити поточну таблицю (з урахуванням пошуку) в Excel"
+                className="flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50 disabled:opacity-50"
+              >
+                <Download className="h-3 w-3" />
+                Excel
+              </button>
               <button
                 type="button"
                 disabled={loading}
@@ -2649,6 +2694,8 @@ function MatomoLogPanel() {
   const [visitsError, setVisitsError] = useState(null);
   const [sortBy, setSortBy] = useState("time");
   const [sortDir, setSortDir] = useState("desc");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState(null);
 
   function toggleSort(column) {
     if (sortBy === column) {
@@ -2706,6 +2753,61 @@ function MatomoLogPanel() {
   const total = summary?.total || 0;
   const totalPages = visits ? Math.max(1, Math.ceil(visits.total / pageSize)) : 1;
   const sitesMultiInstance = new Set(sites.map((s) => s.instance)).size > 1;
+
+  const MATOMO_EXPORT_PAGE_SIZE = 1000;
+  const MATOMO_EXPORT_MAX_ROWS = 20000;
+
+  async function exportVisitsToExcel() {
+    setExporting(true); setExportError(null);
+    try {
+      const allRows = [];
+      let fetchPage = 1;
+      while (true) {
+        const params = new URLSearchParams({
+          from, to, siteId, page: String(fetchPage), pageSize: String(MATOMO_EXPORT_PAGE_SIZE), sortBy, sortDir,
+        });
+        if (activeChip.category) params.set("category", activeChip.category);
+        if (activeChip.source) params.set("source", activeChip.source);
+        const r = await fetch(`${MATOMO_API_BASE}/api/matomo/visits?${params}`);
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Помилка запиту");
+        allRows.push(...d.rows);
+        if (d.rows.length < MATOMO_EXPORT_PAGE_SIZE || allRows.length >= MATOMO_EXPORT_MAX_ROWS) break;
+        fetchPage += 1;
+      }
+
+      const visitsHeader = ["Час", "Тип", "Браузер / бот", "ОС / тип бота", "Пристрій", "Країна", "Джерело / URL", "HTTP", "IP", "Дій"];
+      const visitsRows = allRows.map((v) => {
+        const meta = MATOMO_CATEGORY_META[v.category] || MATOMO_CATEGORY_META.human;
+        return [
+          String(v.time).replace("T", " ").slice(0, 19),
+          meta.label,
+          v.detail || "",
+          v.extra || "",
+          MATOMO_DEVICE_LABELS[v.deviceType] ?? "",
+          v.country ? String(v.country).toUpperCase() : "",
+          v.sourceOrUrl || "",
+          v.httpStatus ?? "",
+          v.ip || "",
+          v.actions ?? "",
+        ];
+      });
+      const wsVisits = XLSX.utils.aoa_to_sheet([visitsHeader, ...visitsRows]);
+
+      const summaryHeader = ["Дата", "Люди", "AI-реферали", "Googlebot", "Bingbot", "AI-боти", "Інші боти"];
+      const summaryRows = (summary?.days || []).map((d) => [d.day, d.human, d.ai_referral, d.google, d.bing, d.ai, d.other_bot]);
+      const wsSummary = XLSX.utils.aoa_to_sheet([summaryHeader, ...summaryRows]);
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, wsSummary, "По днях");
+      XLSX.utils.book_append_sheet(wb, wsVisits, "Візити");
+      XLSX.writeFile(wb, `matomo-vidviduvannya-${from}_${to}.xlsx`);
+    } catch (err) {
+      setExportError(err.message);
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-5 md:col-span-2">
@@ -2828,19 +2930,32 @@ function MatomoLogPanel() {
             </div>
           )}
 
-          <div className="flex flex-wrap gap-1.5">
-            {MATOMO_FILTER_CHIPS.map((chip) => (
-              <button
-                key={chip.key}
-                type="button"
-                onClick={() => setFilterKey(chip.key)}
-                className={`rounded-full px-2.5 py-1 text-xs ${filterKey === chip.key ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
-              >
-                {chip.icon ? `${chip.icon} ${chip.label}` : chip.label}
-              </button>
-            ))}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap gap-1.5">
+              {MATOMO_FILTER_CHIPS.map((chip) => (
+                <button
+                  key={chip.key}
+                  type="button"
+                  onClick={() => setFilterKey(chip.key)}
+                  className={`rounded-full px-2.5 py-1 text-xs ${filterKey === chip.key ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
+                >
+                  {chip.icon ? `${chip.icon} ${chip.label}` : chip.label}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              disabled={exporting || !visits || !summary}
+              onClick={exportVisitsToExcel}
+              title="Вивантажити всі візити за поточним фільтром (до 20 000 рядків) в Excel"
+              className="flex shrink-0 items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50 disabled:opacity-50"
+            >
+              {exporting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+              {exporting ? "Експортую…" : "Excel"}
+            </button>
           </div>
 
+          {exportError && <p className="text-xs text-red-600">⚠️ Не вдалося експортувати: {exportError}</p>}
           {visitsError && <p className="text-xs text-red-600">⚠️ {visitsError}</p>}
 
           <div className="overflow-x-auto rounded-md border border-slate-200">

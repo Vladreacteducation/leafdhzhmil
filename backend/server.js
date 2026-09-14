@@ -407,7 +407,9 @@ app.get('/api/matomo/visits', async (req, res) => {
     // for "people who came via Google search" as opposed to Googlebot crawl requests.
     const source = typeof req.query.source === 'string' && req.query.source.trim() ? req.query.source.trim() : null;
     const page = clampInt(req.query.page, 1, 1, 1_000_000);
-    const pageSize = clampInt(req.query.pageSize, 25, 1, 200);
+    // Interactive table pages use 25; Excel export fetches in larger chunks (up
+    // to 2000/request) to keep the number of round-trips reasonable.
+    const pageSize = clampInt(req.query.pageSize, 25, 1, 2000);
     const offset = (page - 1) * pageSize;
 
     // Whitelisted so req.query.sortBy can never be interpolated as arbitrary SQL.
